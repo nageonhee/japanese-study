@@ -1,0 +1,6 @@
+{
+  "name": "Shinbun Learn",
+  "description": "An editorial-style Japanese learning platform for reading comprehension and vocabulary building.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
