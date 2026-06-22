@@ -7,6 +7,7 @@ export interface Post {
   reference_url: string;
   author_id: number;
   created_at: string;
+  processed_json?: string;
 }
 
 export interface Category {
@@ -15,27 +16,35 @@ export interface Category {
 }
 
 export interface Vocabulary {
-  id: number;
   word: string;
-  base_form: string;
-  reading: string;
+  reading_accent: string;
   meaning: string;
-  difficulty: string;
-  user_id: number;
-  created_at: string;
-  post_id?: number | null;
-  post_title?: string;
+  level?: string;
+}
+
+export interface PostVocabulary {
+  post_title: string;
+  words: Vocabulary[];
 }
 
 export interface Token {
   surface: string;
   base_form: string;
   reading: string;
+  reading_accent?: string;
   pos: string;
+  meaning: string;
 }
 
 export interface ProcessedSentence {
   original: string;
-  translation?: string;
+  translation: string;
   tokens: Token[];
+}
+
+export interface User {
+  id: number;
+  username: string;
+  role: 'master' | 'host' | 'admin' | 'user';
+  token: string;
 }

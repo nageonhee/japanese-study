@@ -2,9 +2,9 @@
 @import "tailwindcss";
 
 @theme {
-  --color-bg: #F8FAFC;
-  --color-text: #0F172A;
-  --color-accent: #4F46E5;
+  --color-bg: #FAF6F0;
+  --color-text: #1F2226;
+  --color-accent: #3A4E68;
   --font-sans: "Noto Sans KR", "Noto Sans JP", ui-sans-serif, system-ui, sans-serif;
   --font-serif: "Noto Serif KR", "Noto Serif JP", serif;
 }
@@ -13,4 +13,29 @@ body {
   background-color: var(--color-bg);
   color: var(--color-text);
   font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
 }
+
+/* Editorial Newspaper Styles */
+.editorial-border-top {
+  border-top: 3px double #3A4E68;
+}
+
+.editorial-border-bottom {
+  border-bottom: 3px double #3A4E68;
+}
+
+.editorial-column-line {
+  border-left: 1px solid #E1DCD3;
+}
+
+.newspaper-paper {
+  background-color: #FAF6F0;
+  border: 1px solid #E5DFD5;
+  box-shadow: 0 4px 12px rgba(42, 35, 27, 0.04);
+}
+
+.editorial-header {
+  border-bottom: 1px solid #3A4E68;
+}
+

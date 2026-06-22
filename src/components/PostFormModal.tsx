@@ -1,9 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { X, Send, Loader2 } from 'lucide-react';
+import { Post } from '../types';
+import { storage } from '../lib/storage';
 
 interface PostFormModalProps {
   onClose: () => void;
   onSaved: () => void;
+  postToEdit?: Post;
+  isPersonal?: boolean;
 }
 
 interface Category {
@@ -11,20 +15,20 @@ interface Category {
   name: string;
 }
 
-export function PostFormModal({ onClose, onSaved }: PostFormModalProps) {
-  const [title, setTitle] = useState('');
-  const [body, setBody] = useState('');
+export function PostFormModal({ onClose, onSaved, postToEdit, isPersonal }: PostFormModalProps) {
+  const [title, setTitle] = useState(postToEdit ? postToEdit.title : '');
+  const [body, setBody] = useState(postToEdit ? postToEdit.body : '');
   const [categories, setCategories] = useState<Category[]>([]);
-  const [selectedCategory, setSelectedCategory] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState(postToEdit ? postToEdit.category_name : '');
   const [customCategory, setCustomCategory] = useState('');
-  const [referenceUrl, setReferenceUrl] = useState('');
+  const [referenceUrl, setReferenceUrl] = useState(postToEdit ? postToEdit.reference_url || '' : '');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   useEffect(() => {
-    fetch('/api/categories')
-      .then(r => r.json())
-      .then(d => setCategories(d));
-  }, []);
+    storage.getCategories(isPersonal)
+      .then(d => setCategories(d))
+      .catch(err => console.error(err));
+  }, [isPersonal]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -34,16 +38,24 @@ export function PostFormModal({ onClose, onSaved }: PostFormModalProps) {
 
     setIsSubmitting(true);
     try {
-      await fetch('/api/posts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      if (postToEdit) {
+        await storage.updatePost(
+          postToEdit.id,
           title,
           body,
-          category_name: finalCategory,
-          reference_url: referenceUrl
-        })
-      });
+          finalCategory,
+          referenceUrl,
+          isPersonal
+        );
+      } else {
+        await storage.createPost(
+          title,
+          body,
+          finalCategory,
+          referenceUrl,
+          isPersonal
+        );
+      }
       onSaved();
       onClose();
     } catch (e) {
@@ -57,7 +69,9 @@ export function PostFormModal({ onClose, onSaved }: PostFormModalProps) {
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm animate-in fade-in duration-200">
       <div className="bg-white rounded-2xl border border-slate-200 w-full max-w-2xl max-h-[90vh] flex flex-col font-sans overflow-hidden">
         <div className="flex items-center justify-between p-5 border-b border-slate-100 bg-white">
-          <h2 className="text-lg font-bold text-slate-800">새 독해 기사 추가</h2>
+          <h2 className="text-lg font-bold text-slate-800">
+            {postToEdit ? '독해 원문 수정' : '새 독해 원문 추가'}
+          </h2>
           <button onClick={onClose} className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-50 rounded-xl transition-colors">
             <X className="w-5 h-5" />
           </button>
@@ -136,7 +150,7 @@ export function PostFormModal({ onClose, onSaved }: PostFormModalProps) {
               disabled={isSubmitting}
               className="flex items-center justify-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-2.5 text-sm font-semibold rounded-xl disabled:opacity-50 transition-colors border border-indigo-700/50"
             >
-              {isSubmitting ? <><Loader2 className="w-4 h-4 animate-spin"/> 처리 중</> : <><Send className="w-4 h-4" /> 등록</>}
+              {isSubmitting ? <><Loader2 className="w-4 h-4 animate-spin"/> 처리 중</> : postToEdit ? <><Send className="w-4 h-4" /> 수정 완료</> : <><Send className="w-4 h-4" /> 등록</>}
             </button>
           </div>
         </form>
