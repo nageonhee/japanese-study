@@ -819,7 +819,7 @@ async function startServer() {
             const prompt = "You are a professional Japanese-Korean translator.\n" +
               "Translate each of the following Japanese sentences into natural Korean.\n" +
               "CRITICAL RULE 1: Strictly maintain the exact politeness level (경어/반말). If the Japanese sentence uses polite/honorific forms (e.g., です, ます, ございます), the Korean translation MUST use polite forms (존댓말: -습니다, -합니다, -해요). If the Japanese uses plain/casual forms (e.g., だ, である), use plain forms (반말: -다, -한다).\n" +
-              "CRITICAL RULE 2: Ensure absolute consistency in proper nouns and character names across all translations. Specifically, ALWAYS translate '御釈迦様' as '부처님', and '犍陀多' (Kandata) as '칸다타'. Do not alternate between synonyms (e.g., do not use 석가, 여래, 석가모니 interchangeably).\n" +
+              "CRITICAL RULE 2: Ensure absolute consistency in proper nouns (character names, places, titles, etc.). Once you choose a Korean translation for a specific entity, you MUST stick to that exact same word for all sentences. Never alternate between synonyms or aliases (e.g., do not randomly switch between different names for the same person).\n" +
               "Maintain the exact numbering format in your output.\n" +
               "Do not include any conversational text. Only output the numbered translations.\n\n" +
               "Input:\n" + numberedInput + "\n\n" +
