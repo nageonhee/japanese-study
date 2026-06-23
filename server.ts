@@ -806,6 +806,9 @@ async function startServer() {
       const sentenceStrings = sentences.map(s => s.original).filter(str => str.trim().length > 0);
       
       if (sentenceStrings.length > 0) {
+        // 전체 원문을 AI에게 문맥으로 제공하기 위해 하나의 문자열로 합침 (너무 길면 앞부분 15000자만 자름)
+        const fullContextText = sentenceStrings.join(" ").substring(0, 15000);
+
         // Batch into groups of 10 to prevent small model cognitive overload and array length mismatches
         const batchSize = 10;
         const translatedStrings: string[] = [];
@@ -817,12 +820,14 @@ async function startServer() {
             
             const numberedInput = batch.map((s, idx) => `[${idx + 1}] ${s}`).join("\n");
             const prompt = "You are a professional Japanese-Korean translator.\n" +
-              "Translate each of the following Japanese sentences into natural Korean.\n" +
+              "Below is the FULL context of the story/article you are translating. Use this ONLY as background knowledge to understand the characters, overarching story, and tone. Do NOT translate the full context.\n" +
+              "=== FULL CONTEXT START ===\n" + fullContextText + "\n=== FULL CONTEXT END ===\n\n" +
+              "Now, translate ONLY the following specific Japanese sentences into natural Korean.\n" +
               "CRITICAL RULE 1: Strictly maintain the exact politeness level (경어/반말). If the Japanese sentence uses polite/honorific forms (e.g., です, ます, ございます), the Korean translation MUST use polite forms (존댓말: -습니다, -합니다, -해요). If the Japanese uses plain/casual forms (e.g., だ, である), use plain forms (반말: -다, -한다).\n" +
               "CRITICAL RULE 2: Ensure absolute consistency in proper nouns (character names, places, titles, etc.). Once you choose a Korean translation for a specific entity, you MUST stick to that exact same word for all sentences. Never alternate between synonyms or aliases (e.g., do not randomly switch between different names for the same person).\n" +
               "Maintain the exact numbering format in your output.\n" +
               "Do not include any conversational text. Only output the numbered translations.\n\n" +
-              "Input:\n" + numberedInput + "\n\n" +
+              "Input to Translate:\n" + numberedInput + "\n\n" +
               "Output Format:\n" +
               "[1] (Korean translation 1)\n" +
               "[2] (Korean translation 2)\n" +
