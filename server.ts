@@ -809,8 +809,8 @@ async function startServer() {
         // 전체 원문을 AI에게 문맥으로 제공하기 위해 하나의 문자열로 합침 (너무 길면 앞부분 15000자만 자름)
         const fullContextText = sentenceStrings.join(" ").substring(0, 15000);
 
-        // Batch into groups of 10 to prevent small model cognitive overload and array length mismatches
-        const batchSize = 10;
+        // Batch into groups of 50 to prevent redundant context token usage and avoid rate limits
+        const batchSize = 50;
         const translatedStrings: string[] = [];
         
         try {
@@ -838,7 +838,7 @@ async function startServer() {
             let parsedTranslations: string[] = [];
 
             while (retries < 3 && !batchSuccess) {
-              const model = process.env.AI_MODEL || "openai/gpt-oss-120b";
+              const model = process.env.AI_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct";
               const baseUrl = process.env.AI_API_URL || process.env.GROQ_API_BASE || "https://api.groq.com/openai/v1";
               
               const response = await fetch(`${baseUrl}/chat/completions`, {
