@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { Post, ProcessedSentence, Token } from '../types';
 import { useStore } from '../store';
-import { ArrowLeft, BookOpen, Loader2, Play, CheckCircle2, BookmarkPlus, Copy, Search, BrainCircuit, Trash2 } from 'lucide-react';
+import { ArrowLeft, BookOpen, Loader2, Play, CheckCircle2, BookmarkPlus, Copy, Search, BrainCircuit, Trash2, Zap } from 'lucide-react';
 import { cn } from '../lib/utils';
 import * as Popover from '@radix-ui/react-popover';
 import { storage, APP_MODE } from '../lib/storage';
@@ -79,8 +79,17 @@ function alignFurigana(surface: string, reading: string): { text: string, ruby?:
   return [{ text: surface, ruby: reading }];
 }
 
+// Check if surface needs furigana: only show for tokens containing kanji (excluding purely numeric tokens)
+function needsFurigana(surface: string): boolean {
+  // Must contain at least one kanji character
+  if (!/[\u4e00-\u9faf\u3400-\u4dbf\uf900-\ufaff々]/.test(surface)) return false;
+  // If it is purely numeric (Arabic, full-width, or Kanji numbers/symbols), do not show yomigana
+  if (/^[0-9\uFF10-\uFF19一二三四五六七八九十百千万億兆\u3007\s\.,•・]+$/.test(surface)) return false;
+  return true;
+}
+
 function FuriganaText({ surface, reading, showFurigana }: { surface: string, reading: string, showFurigana: boolean }) {
-  if (!showFurigana) {
+  if (!showFurigana || !needsFurigana(surface)) {
     return <span className="text-[#1F2226]">{surface}</span>;
   }
   const aligned = alignFurigana(surface, reading);
@@ -98,6 +107,71 @@ function FuriganaText({ surface, reading, showFurigana }: { surface: string, rea
       ))}
     </>
   );
+}
+
+function getLevenshteinDistance(a: string, b: string): number {
+  const tmp: number[][] = [];
+  for (let i = 0; i <= a.length; i++) {
+    tmp[i] = [i];
+  }
+  for (let j = 0; j <= b.length; j++) {
+    tmp[0][j] = j;
+  }
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      tmp[i][j] = Math.min(
+        tmp[i - 1][j] + 1,
+        tmp[i][j - 1] + 1,
+        tmp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+    }
+  }
+  return tmp[a.length][b.length];
+}
+
+function normalizeSynonyms(text: string): string {
+  let normalized = text;
+  const synonymMap: Record<string, string> = {
+    '현지': '지역',
+    '로컬': '지역',
+    '국회의원': '의원',
+    '중원선': '중의원선거',
+    '총선': '중의원선거',
+    '두명': '2명',
+    '두 명': '2명',
+    '2인': '2명',
+    '요번': '이번',
+    '금번': '이번',
+    '되었다': '됐다',
+    '또다시': '또',
+    '다시': '또',
+    '또도': '또',
+    '나의': '우리',
+    '내': '우리',
+    '우리들': '우리'
+  };
+  for (const [key, value] of Object.entries(synonymMap)) {
+    normalized = normalized.split(key).join(value);
+  }
+  return normalized;
+}
+
+function getSimilarity(a: string, b: string): number {
+  const cleanA = a.replace(/[^\w\sㄱ-ㅎㅏ-ㅣ가-힣]/g, '').replace(/\s+/g, '');
+  const cleanB = b.replace(/[^\w\sㄱ-ㅎㅏ-ㅣ가-힣]/g, '').replace(/\s+/g, '');
+  if (cleanA.length === 0 && cleanB.length === 0) return 1;
+  
+  const maxLengthRaw = Math.max(cleanA.length, cleanB.length);
+  const distRaw = getLevenshteinDistance(cleanA, cleanB);
+  const simRaw = 1 - distRaw / maxLengthRaw;
+
+  const normA = normalizeSynonyms(cleanA);
+  const normB = normalizeSynonyms(cleanB);
+  const maxLengthNorm = Math.max(normA.length, normB.length);
+  const distNorm = getLevenshteinDistance(normA, normB);
+  const simNorm = 1 - distNorm / maxLengthNorm;
+
+  return Math.max(simRaw, simNorm);
 }
 
 const splitTrailingTokens = (tokens: Token[]) => {
@@ -239,7 +313,7 @@ export function PostView() {
 
         fallbackList.push({
           original: sentenceText,
-          translation: '기본 직역을 제공할 수 없습니다 (AI 분석 필요)',
+          translation: '기본 직역을 제공할 수 없습니다 (오류 코드 확인 바람)',
           tokens
         });
       }
@@ -277,6 +351,13 @@ export function PostView() {
   }, [isFuriganaEnabled]);
 
   const triggerProcessText = async () => {
+    if (post?.processed_json) {
+      try {
+        const parsed = JSON.parse(post.processed_json);
+        if (parsed.manually_edited) return;
+      } catch (e) {}
+    }
+
     const isFallback = processedData.length === 0 || processedData.some(s => s.tokens.some(t => t.pos === '문장' || (t.pos === '단어' && !t.reading)));
     if (!isFallback) return;
     
@@ -294,6 +375,41 @@ export function PostView() {
     } finally {
       setIsLoadingProcessing(false);
     }
+  };
+
+  const handleLocalGrading = (sentenceIdx: number) => {
+    const submission = submissions[sentenceIdx];
+    if (!submission?.userTranslation || submission.isCorrect !== undefined) return;
+
+    const sentence = processedData[sentenceIdx];
+    const cleanUser = submission.userTranslation.trim();
+    const cleanAI = sentence.translation.trim();
+
+    const similarity = getSimilarity(cleanUser, cleanAI);
+    const simPercent = Math.min(Math.round(similarity * 100) + 20, 100);
+    
+    let threshold = 0.65; // 'medium'
+    if (difficulty === 'low') threshold = 0.40;
+    if (difficulty === 'high') threshold = 0.85;
+
+    const isCorrect = similarity >= threshold;
+    let feedback = '';
+
+    if (isCorrect) {
+      feedback = `로컬 빠른 채점 완료 (유사도 ${simPercent}%): 모범 번역과 높은 일치율을 보입니다. 훌륭합니다!`;
+    } else {
+      feedback = `로컬 빠른 채점 완료 (유사도 ${simPercent}%): 모범 번역과 차이가 다소 큽니다. 핵심 단어와 어순을 확인해 보세요.`;
+    }
+
+    setSubmissions(prev => ({
+      ...prev,
+      [sentenceIdx]: {
+        ...prev[sentenceIdx],
+        isCorrect,
+        feedback,
+        properTranslation: sentence.translation
+      }
+    }));
   };
 
   const handleTranslationSubmit = async (e: React.FormEvent, sentenceIdx: number) => {
@@ -391,52 +507,95 @@ export function PostView() {
 
   return (
     <div className="flex-1 pb-24 mx-auto w-full max-w-4xl font-serif">
-      <header className="mb-8 border-b border-[#E5DFD5] pb-6 font-sans">
-        <div className="flex justify-between items-center mb-4">
-          <button onClick={() => navigate(-1)} className="flex items-center gap-1 text-[#3A4E68] hover:underline transition-colors text-xs font-bold">
+      <header className="mb-6 sm:mb-8 border-b border-[#E5DFD5] pb-4 sm:pb-6 font-sans">
+        <div className="mb-4">
+          <button onClick={() => navigate(-1)} className="flex items-center gap-1 text-[#3A4E68] hover:underline transition-colors text-xs font-bold self-start">
             <ArrowLeft className="w-4 h-4" /> 목록으로 돌아가기
           </button>
-          
-          {/* Conditional Modify/Delete Buttons */}
-          {(isPersonal || (user && (user.role === 'master' || user.role === 'host' || user.role === 'admin' || user.id === post?.author_id))) && (
-            <div className="flex items-center gap-2">
+        </div>
+
+        <div className="flex flex-col sm:flex-row sm:justify-between sm:items-end gap-4">
+          <div>
+            <div className="flex items-center gap-3 text-xs font-semibold text-slate-500 mb-3">
+              <span className="text-[#3A4E68] border border-[#3A4E68] px-2 py-0.5 rounded-md font-bold text-[10px]">{post.category_name}</span>
+              <span>{new Date(post.created_at).toLocaleDateString()}</span>
+            </div>
+            <h1 className="text-xl sm:text-3xl lg:text-4xl font-bold text-slate-900 leading-tight tracking-tight font-serif">{post.title}</h1>
+          </div>
+
+          {/* Conditional Modify/Delete/Refresh Buttons */}
+          <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+            {user?.username === 'chris77467' && (
+              <button 
+                onClick={async () => {
+                  if (!post || !post.body) return;
+                  if (!confirm("번역을 새로고침 하시겠습니까? 기존 번역 데이터가 덮어씌워집니다.")) return;
+                  
+                  try {
+                    const res = await fetch('/api/process-text', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ text: post.body })
+                    });
+                    if (res.ok) {
+                      const data = await res.json();
+                      const jsonString = JSON.stringify(data);
+                      await storage.updatePostProcessedJson(post.id, jsonString, isPersonal);
+                      setProcessedData(data.sentences || []);
+                      alert("번역을 성공적으로 새로고침했습니다.");
+                    } else {
+                      alert("번역 새로고침 실패: " + res.status);
+                    }
+                  } catch (e) {
+                    console.error(e);
+                    alert("번역 새로고침 중 오류가 발생했습니다.");
+                  }
+                }}
+                className="text-[11px] sm:text-xs font-bold text-indigo-600 hover:bg-indigo-50 transition-colors flex items-center gap-1 px-2 sm:px-3 py-1.5 rounded-lg border border-indigo-200"
+              >
+                번역 새로고침
+              </button>
+            )}
+
+            {(isPersonal || (user && (user.role === 'master' || user.role === 'host' || user.role === 'admin' || user.id === post?.author_id))) && (
               <button 
                 onClick={() => setIsEditModalOpen(true)}
-                className="text-xs font-bold text-[#3A4E68] hover:bg-[#E5DFD5]/40 transition-colors flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#E5DFD5]"
+                className="text-[11px] sm:text-xs font-bold text-[#3A4E68] hover:bg-[#E5DFD5]/40 transition-colors flex items-center gap-1 px-2 sm:px-3 py-1.5 rounded-lg border border-[#E5DFD5]"
               >
                 원문 수정
               </button>
+            )}
+            
+            {(isPersonal || user) && (
               <button 
                 onClick={() => setIsYomiganaModalOpen(true)}
-                className="text-xs font-bold text-[#3A4E68] hover:bg-[#E5DFD5]/40 transition-colors flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#E5DFD5]"
+                className="text-[11px] sm:text-xs font-bold text-[#3A4E68] hover:bg-[#E5DFD5]/40 transition-colors flex items-center gap-1 px-2 sm:px-3 py-1.5 rounded-lg border border-[#E5DFD5]"
               >
                 요미가나 수정
               </button>
+            )}
+
+            {(isPersonal || (user && (user.role === 'master' || user.role === 'host' || user.role === 'admin' || user.id === post?.author_id))) && (
               <button 
                 onClick={handleDeletePost}
-                className="text-xs font-bold text-red-500 hover:text-red-700 transition-colors flex items-center gap-1.5 bg-red-50/20 hover:bg-red-50 px-3 py-1.5 rounded-lg border border-red-200/40"
+                className="text-[11px] sm:text-xs font-bold text-red-500 hover:text-red-700 transition-colors flex items-center gap-1 bg-red-50/20 hover:bg-red-50 px-2 sm:px-3 py-1.5 rounded-lg border border-red-200/40"
               >
-                <Trash2 className="w-3.5 h-3.5" /> 원문 삭제
+                <Trash2 className="w-3 h-3 sm:w-3.5 sm:h-3.5" /> 삭제
               </button>
-            </div>
-          )}
+            )}
+          </div>
         </div>
-        <div className="flex items-center gap-3 text-xs font-semibold text-slate-500 mb-3">
-          <span className="text-[#3A4E68] border border-[#3A4E68] px-2 py-0.5 rounded-md font-bold text-[10px]">{post.category_name}</span>
-          <span>{new Date(post.created_at).toLocaleDateString()}</span>
-        </div>
-        <h1 className="text-3xl lg:text-4xl font-bold text-slate-900 leading-tight tracking-tight font-serif">{post.title}</h1>
       </header>
 
       {/* Mode and Toggle Controls */}
-      <nav className="mb-8 flex flex-col sm:flex-row gap-4 items-start sm:items-center justify-between border-b border-[#E5DFD5] pb-4 font-sans text-sm">
-        <div className="flex flex-wrap items-center gap-3 w-full sm:w-auto">
+      <nav className="mb-8 flex justify-between items-center border-b border-[#E5DFD5] pb-4 font-sans text-sm gap-4">
+        <div className="flex-1 max-w-[60%] sm:max-w-none">
           {mode === 'original' && (
-            <div className="flex gap-1.5 bg-[#E5DFD5]/40 p-1 rounded-xl border border-[#E5DFD5]/60">
+            <div className="flex flex-col sm:flex-row gap-1.5 bg-[#E5DFD5]/40 p-1 rounded-xl border border-[#E5DFD5]/60 w-full sm:w-auto">
               <button 
                 onClick={() => setLocalShowFurigana(!localShowFurigana)}
                 className={cn(
-                  "px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200", 
+                  "px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 text-center", 
                   localShowFurigana 
                     ? "bg-[#3A4E68] text-white" 
                     : "text-[#3A4E68] hover:bg-[#E5DFD5]/80"
@@ -450,7 +609,7 @@ export function PostView() {
                   triggerProcessText();
                 }}
                 className={cn(
-                  "px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200", 
+                  "px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 text-center", 
                   showTranslation 
                     ? "bg-[#3A4E68] text-white" 
                     : "text-[#3A4E68] hover:bg-[#E5DFD5]/80"
@@ -462,56 +621,58 @@ export function PostView() {
           )}
 
           {mode === 'learning' && (
-            <div className="flex items-center gap-2 bg-[#E5DFD5]/40 p-1 rounded-xl border border-[#E5DFD5]/60">
-              <span className="text-xs font-bold text-[#3A4E68] pl-2">채점 난이도:</span>
-              {(['low', 'medium', 'high'] as const).map((lvl) => (
-                <button
-                  key={lvl}
-                  onClick={() => setDifficulty(lvl)}
-                  className={cn(
-                    "px-2.5 py-1 rounded-lg text-xs font-bold transition-all duration-200",
-                    difficulty === lvl
-                      ? "bg-[#3A4E68] text-white"
-                      : "text-slate-600 hover:text-slate-900"
-                  )}
-                >
-                  {lvl === 'low' && '하'}
-                  {lvl === 'medium' && '중'}
-                  {lvl === 'high' && '상'}
-                </button>
-              ))}
+            <div className="flex flex-col sm:flex-row items-start sm:items-center gap-1 bg-[#E5DFD5]/40 p-1.5 sm:p-1 rounded-xl border border-[#E5DFD5]/60 w-full sm:w-auto font-sans">
+              <span className="text-[10px] sm:text-xs font-bold text-[#3A4E68] px-2 py-1 sm:py-0">채점 난이도:</span>
+              <div className="flex gap-1 w-full sm:w-auto justify-between sm:justify-start">
+                {(['low', 'medium', 'high'] as const).map((lvl) => (
+                  <button
+                    key={lvl}
+                    onClick={() => setDifficulty(lvl)}
+                    className={cn(
+                      "flex-1 sm:flex-none px-2.5 py-1 rounded-lg text-[10px] sm:text-xs font-bold transition-all duration-200 text-center",
+                      difficulty === lvl
+                        ? "bg-[#3A4E68] text-white"
+                        : "text-slate-650 hover:text-slate-900"
+                    )}
+                  >
+                    {lvl === 'low' && '하'}
+                    {lvl === 'medium' && '중'}
+                    {lvl === 'high' && '상'}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
-          
-          <div className="flex bg-[#E5DFD5]/40 p-1 rounded-xl ml-auto sm:ml-0 border border-[#E5DFD5]/60">
-            <button 
-              onClick={() => setMode('original')}
-              className={cn(
-                "px-4 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200", 
-                mode === 'original' 
-                  ? "bg-[#3A4E68] text-white" 
-                  : "text-[#3A4E68] hover:bg-[#E5DFD5]/80"
-              )}
-            >
-              1. 원문 읽기
-            </button>
-            <button 
-              onClick={() => {
-                setMode('learning');
-                triggerProcessText();
-              }}
-              disabled={isLoadingProcessing}
-              className={cn(
-                "px-4 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all duration-200", 
-                mode === 'learning' 
-                  ? "bg-[#3A4E68] text-white" 
-                  : "text-[#3A4E68] hover:bg-[#E5DFD5]/80"
-              )}
-            >
-              {isLoadingProcessing && <Loader2 className="w-3 h-3 animate-spin text-slate-700"/>}
-              2. 번역 모드
-            </button>
-          </div>
+        </div>
+        
+        <div className="flex bg-[#E5DFD5]/40 p-1 rounded-xl border border-[#E5DFD5]/60 flex-shrink-0 self-start sm:self-center">
+          <button 
+            onClick={() => setMode('original')}
+            className={cn(
+              "px-3 py-1.5 sm:px-4 sm:py-1.5 rounded-lg text-[11px] sm:text-xs font-semibold transition-all duration-200", 
+              mode === 'original' 
+                ? "bg-[#3A4E68] text-white" 
+                : "text-[#3A4E68] hover:bg-[#E5DFD5]/80"
+            )}
+          >
+            1. 원문 읽기
+          </button>
+          <button 
+            onClick={() => {
+              setMode('learning');
+              triggerProcessText();
+            }}
+            disabled={isLoadingProcessing}
+            className={cn(
+              "px-3 py-1.5 sm:px-4 sm:py-1.5 rounded-lg text-[11px] sm:text-xs font-semibold flex items-center gap-1 transition-all duration-200", 
+              mode === 'learning' 
+                ? "bg-[#3A4E68] text-white" 
+                : "text-[#3A4E68] hover:bg-[#E5DFD5]/80"
+            )}
+          >
+            {isLoadingProcessing && <Loader2 className="w-3 h-3 animate-spin text-slate-700"/>}
+            2. 번역 모드
+          </button>
         </div>
       </nav>
 
@@ -548,13 +709,14 @@ export function PostView() {
                                 {innerSpan}
                               </Popover.Trigger>
                               <Popover.Portal>
-                                <Popover.Content sideOffset={5} className="bg-[#1F2226] text-white p-4 font-sans text-sm w-64 rounded-xl border border-slate-800 z-50 shadow-xl flex flex-col gap-2">
+                                <Popover.Content sideOffset={5} onInteractOutside={(e) => { if ((e.target as HTMLElement)?.closest?.('[data-radix-popover-content]')) e.preventDefault(); }} className="bg-[#1F2226] text-white p-3 sm:p-4 font-sans text-sm w-60 sm:w-64 rounded-xl border border-slate-800 z-50 shadow-xl flex flex-col gap-2">
                                   <div className="font-bold text-base mb-1 border-b border-slate-700 pb-1 flex justify-between items-center">
                                     <span>{token.surface}</span>
                                     <span className="text-[10px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded font-mono font-medium">{token.pos}</span>
                                   </div>
-                                  <div className="text-slate-400 mb-1 text-xs font-semibold">
-                                    {dictAccent || token.reading_accent || token.reading} {token.base_form !== token.surface ? '(' + token.base_form + ')' : ''}
+                                  <div className="text-slate-400 mb-1 text-xs font-semibold flex items-center gap-1.5 flex-wrap">
+                                    <span dangerouslySetInnerHTML={{ __html: dictAccent || token.reading_accent || token.reading || '' }} />
+                                    {token.base_form !== token.surface && <span className="text-[10px] text-slate-500">({token.base_form})</span>}
                                   </div>
                                   <div className="text-xs rounded border border-slate-700/60 bg-slate-800/80 p-2.5 flex flex-col gap-1">
                                     <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">네이버 사전 뜻</span>
@@ -564,7 +726,11 @@ export function PostView() {
                                       <span className="text-slate-200 font-medium leading-relaxed">{dictMeaning || '뜻을 찾을 수 없습니다.'}</span>
                                     )}
                                   </div>
-                                  <button onClick={() => saveToWordbook(token, dictMeaning)} className="flex items-center justify-center gap-1.5 bg-[#3A4E68] hover:bg-[#2C3B4F] rounded-lg py-2 transition-colors text-xs font-bold text-white shadow mt-1">
+                                  <button 
+                                    onPointerDown={(e) => { e.stopPropagation(); }}
+                                    onClick={(e) => { e.stopPropagation(); e.preventDefault(); saveToWordbook(token, dictMeaning); }} 
+                                    className="flex items-center justify-center gap-1.5 bg-[#3A4E68] hover:bg-[#2C3B4F] active:bg-[#1E2D3F] rounded-lg py-2.5 transition-colors text-xs font-bold text-white shadow mt-1 touch-manipulation"
+                                  >
                                     <BookmarkPlus className="w-3.5 h-3.5"/> 단어장에 추가
                                   </button>
                                 </Popover.Content>
@@ -605,13 +771,14 @@ export function PostView() {
                                     {innerSpan}
                                   </Popover.Trigger>
                                   <Popover.Portal>
-                                    <Popover.Content sideOffset={5} className="bg-[#1F2226] text-white p-4 font-sans text-sm w-64 rounded-xl border border-slate-800 z-50 shadow-xl flex flex-col gap-2">
+                                    <Popover.Content sideOffset={5} onInteractOutside={(e) => { if ((e.target as HTMLElement)?.closest?.('[data-radix-popover-content]')) e.preventDefault(); }} className="bg-[#1F2226] text-white p-3 sm:p-4 font-sans text-sm w-60 sm:w-64 rounded-xl border border-slate-800 z-50 shadow-xl flex flex-col gap-2">
                                       <div className="font-bold text-base mb-1 border-b border-slate-700 pb-1 flex justify-between items-center">
                                         <span>{token.surface}</span>
                                         <span className="text-[10px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded font-mono font-medium">{token.pos}</span>
                                       </div>
-                                      <div className="text-slate-400 mb-1 text-xs font-semibold">
-                                        {dictAccent || token.reading_accent || token.reading} {token.base_form !== token.surface ? '(' + token.base_form + ')' : ''}
+                                      <div className="text-slate-400 mb-1 text-xs font-semibold flex items-center gap-1.5 flex-wrap">
+                                        <span dangerouslySetInnerHTML={{ __html: dictAccent || token.reading_accent || token.reading || '' }} />
+                                        {token.base_form !== token.surface && <span className="text-[10px] text-slate-500">({token.base_form})</span>}
                                       </div>
                                       <div className="text-xs rounded border border-slate-700/60 bg-slate-800/80 p-2.5 flex flex-col gap-1">
                                         <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">네이버 사전 뜻</span>
@@ -621,7 +788,11 @@ export function PostView() {
                                           <span className="text-slate-200 font-medium leading-relaxed">{dictMeaning || '뜻을 찾을 수 없습니다.'}</span>
                                         )}
                                       </div>
-                                      <button onClick={() => saveToWordbook(token, dictMeaning)} className="flex items-center justify-center gap-1.5 bg-[#3A4E68] hover:bg-[#2C3B4F] rounded-lg py-2 transition-colors text-xs font-bold text-white shadow mt-1">
+                                      <button 
+                                        onPointerDown={(e) => { e.stopPropagation(); }}
+                                        onClick={(e) => { e.stopPropagation(); e.preventDefault(); saveToWordbook(token, dictMeaning); }} 
+                                        className="flex items-center justify-center gap-1.5 bg-[#3A4E68] hover:bg-[#2C3B4F] active:bg-[#1E2D3F] rounded-lg py-2.5 transition-colors text-xs font-bold text-white shadow mt-1 touch-manipulation"
+                                      >
                                         <BookmarkPlus className="w-3.5 h-3.5"/> 단어장에 추가
                                       </button>
                                     </Popover.Content>
@@ -694,13 +865,14 @@ export function PostView() {
                             {innerSpan}
                           </Popover.Trigger>
                           <Popover.Portal>
-                            <Popover.Content sideOffset={5} className="bg-[#1F2226] text-white p-4 font-sans text-sm w-64 rounded-xl border border-slate-800 z-50 shadow-xl flex flex-col gap-2">
+                            <Popover.Content sideOffset={5} onInteractOutside={(e) => { if ((e.target as HTMLElement)?.closest?.('[data-radix-popover-content]')) e.preventDefault(); }} className="bg-[#1F2226] text-white p-3 sm:p-4 font-sans text-sm w-60 sm:w-64 rounded-xl border border-slate-800 z-50 shadow-xl flex flex-col gap-2">
                               <div className="font-bold text-base mb-1 border-b border-slate-700 pb-1 flex justify-between items-center">
                                 <span>{token.surface}</span>
                                 <span className="text-[10px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded font-mono">{token.pos}</span>
                               </div>
-                              <div className="text-slate-400 mb-1 text-xs font-semibold">
-                                {dictAccent || token.reading_accent || token.reading} {token.base_form !== token.surface ? '(' + token.base_form + ')' : ''}
+                              <div className="text-slate-400 mb-1 text-xs font-semibold flex items-center gap-1.5 flex-wrap">
+                                <span dangerouslySetInnerHTML={{ __html: dictAccent || token.reading_accent || token.reading || '' }} />
+                                {token.base_form !== token.surface && <span className="text-[10px] text-slate-500">({token.base_form})</span>}
                               </div>
                               <div className="text-xs rounded border border-slate-700/60 bg-slate-800/80 p-2.5 flex flex-col gap-1">
                                 <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">네이버 사전 뜻</span>
@@ -710,7 +882,11 @@ export function PostView() {
                                   <span className="text-slate-200 font-medium leading-relaxed">{dictMeaning || '뜻을 찾을 수 없습니다.'}</span>
                                 )}
                               </div>
-                              <button onClick={() => saveToWordbook(token, dictMeaning)} className="flex items-center justify-center gap-1.5 bg-[#3A4E68] hover:bg-[#2C3B4F] rounded-lg py-2 transition-colors text-xs font-bold text-white shadow mt-1">
+                              <button 
+                                onPointerDown={(e) => { e.stopPropagation(); }}
+                                onClick={(e) => { e.stopPropagation(); e.preventDefault(); saveToWordbook(token, dictMeaning); }} 
+                                className="flex items-center justify-center gap-1.5 bg-[#3A4E68] hover:bg-[#2C3B4F] active:bg-[#1E2D3F] rounded-lg py-2.5 transition-colors text-xs font-bold text-white shadow mt-1 touch-manipulation"
+                              >
                                 <BookmarkPlus className="w-3.5 h-3.5"/> 단어장에 추가
                               </button>
                             </Popover.Content>
@@ -732,15 +908,24 @@ export function PostView() {
                         rows={2}
                         value={submissions[sIdx]?.userTranslation || ''}
                         onChange={(e) => handleUserTranslationChange(sIdx, e.target.value)}
+                        onFocus={() => setCurrentSentenceIdx(sIdx)}
                       />
-                      {isActive && (
-                        <div className="flex justify-end">
+                      {(submissions[sIdx]?.userTranslation || '').trim() !== '' && (
+                        <div className="flex justify-end gap-2">
+                          <button 
+                            type="button"
+                            onClick={() => handleLocalGrading(sIdx)}
+                            className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-xl text-xs font-bold transition-all duration-200 border border-emerald-700/10 flex items-center gap-1.5 shadow-sm active:scale-95 hover:shadow-md animate-in fade-in slide-in-from-bottom-2 duration-200"
+                          >
+                            <Zap className="w-3.5 h-3.5 fill-emerald-100" />
+                            빠른 채점 (로컬)
+                          </button>
                           <button 
                             type="submit"
-                            disabled={!submissions[sIdx]?.userTranslation || isGrading[sIdx]}
-                            className="bg-[#3A4E68] text-white px-5 py-2.5 rounded-xl text-xs font-bold hover:bg-[#2C3B4F] disabled:opacity-50 transition-colors border border-slate-900/10 flex items-center gap-1.5 shadow-sm"
+                            disabled={isGrading[sIdx]}
+                            className="bg-[#3A4E68] text-white px-5 py-2.5 rounded-xl text-xs font-bold hover:bg-[#2C3B4F] disabled:opacity-50 transition-all duration-200 border border-slate-900/10 flex items-center gap-1.5 shadow-sm active:scale-95 hover:shadow-md animate-in fade-in slide-in-from-bottom-2 duration-200"
                           >
-                            {isGrading[sIdx] ? <Loader2 className="w-3.5 h-3.5 animate-spin"/> : null}
+                            {isGrading[sIdx] ? <Loader2 className="w-3.5 h-3.5 animate-spin"/> : <BrainCircuit className="w-3.5 h-3.5" />}
                             AI 채점 요청
                           </button>
                         </div>
@@ -831,7 +1016,9 @@ export function PostView() {
           post={post}
           processedData={processedData}
           isPersonal={isPersonal}
-          onClose={() => setIsYomiganaModalOpen(false)}
+          onClose={() => {
+            setIsYomiganaModalOpen(false);
+          }}
           onSaved={() => {
             fetchPost();
             setIsYomiganaModalOpen(false);

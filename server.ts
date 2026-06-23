@@ -3,7 +3,6 @@ import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import Database from 'better-sqlite3';
-import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import kuromoji from 'kuromoji';
 import crypto from 'crypto';
@@ -108,21 +107,21 @@ function formatAccentNotation(reading: string, accentStr: string): string {
   
   // Split reading into morae
   const morae = splitIntoMorae(reading);
+  const L = morae.length;
+  if (L === 0) return reading;
   
   if (accentNum === 0) {
-    // 平板型: reading￣ [0]
-    return `${reading}￣ [0]`;
+    // Flat type (0): Mora 1 is Low, Mora 2 to L are High
+    if (L === 1) return reading;
+    return `${morae[0]}<strong>${morae.slice(1).join('')}</strong>`;
+  } else if (accentNum === 1) {
+    // Head-high type (1): Mora 1 is High, Mora 2 to L are Low
+    return `<strong>${morae[0]}</strong>${morae.slice(1).join('')}`;
   } else {
-    // 起伏型: insert ＼ after the accent mora
-    // mora1mora2＼mora3... [N]
-    let result = '';
-    for (let i = 0; i < morae.length; i++) {
-      result += morae[i];
-      if (i === accentNum - 1) {
-        result += '＼';
-      }
-    }
-    return `${result} [${accentNum}]`;
+    // Middle/Tail-high type (N): Mora 1 is Low, Mora 2 to N are High, Mora N+1 to L are Low
+    const highEnd = Math.min(accentNum, L);
+    const lowStart = highEnd;
+    return `${morae[0]}<strong>${morae.slice(1, highEnd).join('')}</strong>${morae.slice(lowStart).join('')}`;
   }
 }
 
@@ -167,7 +166,8 @@ const posMap: Record<string, string> = {
   'その他': '기타'
 };
 
-const db = new Database('data.db', { verbose: console.log });
+const dbPath = process.env.DATABASE_PATH || 'data.db';
+const db = new Database(dbPath, { verbose: console.log });
 db.pragma('journal_mode = WAL');
 
 // Migrate vocabulary table if it doesn't have the new schema
@@ -295,7 +295,8 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: '10mb' }));
+  app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
   // --- Authentication Middleware ---
   const authenticate = (req: any, res: any, next: any) => {
@@ -407,29 +408,7 @@ async function startServer() {
     res.json(req.user);
   });
 
-  // Helper function to translate text using Google Translate Free API
-  async function translateTextUsingGoogle(text: string): Promise<string> {
-    try {
-      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=ja&tl=ko&dt=t&q=${encodeURIComponent(text)}`;
-      const res = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        }
-      });
-      if (!res.ok) throw new Error(`Google Translate API returned status ${res.status}`);
-      const data = await res.json() as any;
-      if (data && data[0] && Array.isArray(data[0])) {
-        const translatedParts = data[0]
-          .map((part: any) => part[0])
-          .filter((val: any) => typeof val === 'string');
-        return translatedParts.join('').trim();
-      }
-      return '';
-    } catch (err) {
-      console.error("Google Translation failed:", err);
-      return '번역을 가져올 수 없습니다.';
-    }
-  }
+
 
   interface MergedToken {
     surface: string;
@@ -731,161 +710,51 @@ async function startServer() {
     return result;
   }
 
-  // Gemini single-payload translation & hiragana conversion function
-  async function analyzeTextWithGeminiCombined(text: string): Promise<any> {
-    const key = process.env.GEMINI_API_KEY;
-    if (!key) {
-      throw new Error('GEMINI_API_KEY environment variable is missing.');
-    }
+  // Simple Naver dictionary cache
+  const naverCache = new Map<string, string>();
 
-    const ai = new GoogleGenAI({ apiKey: key });
-    const prompt = "You are a professional Japanese-Korean translator and linguist.\n" +
-      "Analyze the following Japanese text.\n" +
-      "To minimize API usage, you must process the entire text in a single response.\n\n" +
-      "Return a JSON object with the following fields:\n" +
-      "1. \"hiragana\": The entire original Japanese text rewritten completely in Hiragana.\n" +
-      "   - Replace all Kanji characters with their correct Hiragana pronunciation based on the context.\n" +
-      "   - Keep Katakana, Hiragana, punctuation (。！？, etc.), English/alphanumeric characters, spaces, and newlines (\\n) EXACTLY as they are in the original text.\n" +
-      "   - Do not add, remove, or modify any non-Kanji characters, spaces, or newlines. The length and structure must correspond exactly to the original text.\n\n" +
-      "2. \"sentences\": An array of sentences split from the original text (split by punctuation like 。！？ or newlines).\n" +
-      "   For each sentence, provide:\n" +
-      "   - \"original\": The exact Japanese text of the sentence.\n" +
-      "   - \"translation\": The Korean translation of the sentence.\n\n" +
-      "Original Japanese text:\n" + text;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            hiragana: { type: Type.STRING },
-            sentences: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  original: { type: Type.STRING },
-                  translation: { type: Type.STRING }
-                },
-                required: ["original", "translation"]
-              }
-            }
-          },
-          required: ["hiragana", "sentences"]
+  async function getNaverReading(surface: string): Promise<string> {
+    if (naverCache.has(surface)) return naverCache.get(surface)!;
+    try {
+      const url = `https://ja.dict.naver.com/api3/jako/search?query=${encodeURIComponent(surface)}`;
+      const response = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': 'https://ja.dict.naver.com/'
         }
+      });
+      const data = await response.json();
+      const items = data?.searchResultMap?.searchResultListMap?.WORD?.items;
+      let reading = '';
+      if (items && items.length > 0) {
+        const bestItem = items.find((item: any) => item.meansCollector && item.meansCollector.length > 0) || items[0];
+        reading = bestItem.show_hira || bestItem.expEntry || '';
+        reading = reading.replace(/<[^>]*>/g, '').replace(/\[.*\]/g, '').trim();
       }
-    });
-
-    return JSON.parse(response.text || '{}');
+      naverCache.set(surface, reading);
+      return reading;
+    } catch (e) {
+      console.error("Naver lookup failed for", surface, e);
+      naverCache.set(surface, '');
+      return '';
+    }
   }
 
-  // Text analyzer combining Gemini optimized API calls and local alignment
+  // Text analyzer combining OpenAI translation batching and local Kuromoji tokenization
   async function analyzeTextLocally(text: string): Promise<any> {
-    const key = process.env.GEMINI_API_KEY;
+    const key = process.env.AI_API_KEY || process.env.OPENAI_API_KEY;
+    const useAI = key && key !== "YOUR_OPENAI_API_KEY" && key !== "YOUR_AI_API_KEY";
+    
+    let errorCode = "알 수 없음";
+    let errorDetail = "";
 
-    // 1. Gemini hybrid mode
-    if (key && key !== "YOUR_GEMINI_API_KEY") {
-      try {
-        console.log("Analyzing text using Gemini combined optimized mode...");
-        const result = await analyzeTextWithGeminiCombined(text);
-        const fullHiragana = result.hiragana || '';
-        const geminiSentences = result.sentences || [];
-
-        const fullAlignment = alignOriginalAndHiragana(text, fullHiragana);
-
-        const sentences: any[] = [];
-        let lastFoundIndex = 0;
-
-        for (const s of geminiSentences) {
-          const sentText = s.original;
-          let startIdx = text.indexOf(sentText, lastFoundIndex);
-          if (startIdx === -1) {
-            startIdx = text.indexOf(sentText);
-          }
-          if (startIdx !== -1) {
-            lastFoundIndex = startIdx + sentText.length;
-          } else {
-            startIdx = lastFoundIndex;
-          }
-
-          const tokens: any[] = [];
-          if (sentText.trim()) {
-            if (tokenizer) {
-              try {
-                const parsedTokens = tokenizer.tokenize(sentText);
-                const mergedTokens = mergeKuromojiTokens(parsedTokens);
-
-                let currentOffset = 0;
-                for (const t of mergedTokens) {
-                  let tokStart = sentText.indexOf(t.surface, currentOffset);
-                  if (tokStart === -1) tokStart = currentOffset;
-                  const tokEnd = tokStart + t.surface.length;
-                  currentOffset = tokEnd;
-
-                  const absStart = startIdx + tokStart;
-                  const absEnd = startIdx + tokEnd;
-
-                  let tokenReading = '';
-                  if (absStart >= 0 && absEnd <= fullAlignment.length) {
-                    tokenReading = fullAlignment.slice(absStart, absEnd).join('');
-                  } else {
-                    tokenReading = t.reading;
-                  }
-
-                  const accentInfo = lookupAccent(t.base_form || t.surface, tokenReading || undefined);
-
-                  tokens.push({
-                    surface: t.surface,
-                    base_form: t.base_form,
-                    reading: tokenReading,
-                    reading_accent: accentInfo ? accentInfo.formatted : '',
-                    pos: t.pos,
-                    meaning: ''
-                  });
-                }
-              } catch (tokErr) {
-                console.error("Kuromoji tokenization failed for sentence:", sentText, tokErr);
-                tokenizeWithIntlSegmenterAndAlignment(sentText, tokens, startIdx, fullAlignment);
-              }
-            } else {
-              tokenizeWithIntlSegmenterAndAlignment(sentText, tokens, startIdx, fullAlignment);
-            }
-          }
-
-          const finalTokens = fillMissingWhitespace(sentText, tokens);
-          sentences.push({
-            original: sentText,
-            translation: s.translation,
-            tokens: finalTokens
-          });
-        }
-
-        return { sentences };
-      } catch (geminiErr) {
-        console.warn("Gemini hybrid analysis failed, falling back to local analysis:", geminiErr);
-      }
-    }
-
-    // 2. Offline / Local fallback using Kuromoji (0 cost)
-    console.log("Analyzing text using local offline mode (Kuromoji)...");
+    console.log("Analyzing text using local offline mode (Kuromoji) for Tokenization...");
     const rawSentences = splitTextIntoSentences(text);
     const sentences: any[] = [];
 
+    // Step 1: Tokenize everything perfectly using Kuromoji + Naver Dict fallback
     for (const originalSentence of rawSentences) {
-      let translation = '번역을 가져올 수 없습니다.';
-      if (originalSentence.trim()) {
-        try {
-          translation = await translateTextUsingGoogle(originalSentence);
-        } catch (err) {
-          translation = '번역을 가져올 수 없습니다.';
-        }
-      } else {
-        translation = originalSentence; // newlines/spaces translate to themselves
-      }
-
+      const translation = originalSentence.trim() ? `번역을 가져올 수 없습니다 (오류 코드: AI 미사용).` : originalSentence;
       const tokens: any[] = [];
       if (originalSentence.trim()) {
         if (tokenizer) {
@@ -894,13 +763,21 @@ async function startServer() {
             const mergedTokens = mergeKuromojiTokens(parsedTokens);
 
             for (const t of mergedTokens) {
-              const hiraReading = t.reading;
-              const accentInfo = lookupAccent(t.base_form || t.surface, hiraReading || undefined);
+              const isNumeric = /^[0-9\uFF10-\uFF19一二三四五六七八九十百千万億兆\u3007\s\.,•・]+$/.test(t.surface);
+              let hiraReadingClean = isNumeric ? '' : t.reading;
+              
+              // Naver Dictionary Fallback for Unknown Kanji words
+              if (!isNumeric && /[\u4e00-\u9faf]/.test(t.surface) && hiraReadingClean === t.surface) {
+                const naverReading = await getNaverReading(t.surface);
+                if (naverReading) hiraReadingClean = naverReading;
+              }
+
+              const accentInfo = isNumeric ? null : lookupAccent(t.base_form || t.surface, hiraReadingClean || undefined);
 
               tokens.push({
                 surface: t.surface,
                 base_form: t.base_form,
-                reading: hiraReading,
+                reading: hiraReadingClean,
                 reading_accent: accentInfo ? accentInfo.formatted : '',
                 pos: t.pos,
                 meaning: ''
@@ -923,7 +800,127 @@ async function startServer() {
       });
     }
 
-    return { sentences };
+    // Step 2: AI Batch Translation
+    if (useAI) {
+      console.log("AI Key found. Batch translating sentences...");
+      const sentenceStrings = sentences.map(s => s.original).filter(str => str.trim().length > 0);
+      
+      if (sentenceStrings.length > 0) {
+        // Batch into groups of 10 to prevent small model cognitive overload and array length mismatches
+        const batchSize = 10;
+        const translatedStrings: string[] = [];
+        
+        try {
+          for (let i = 0; i < sentenceStrings.length; i += batchSize) {
+            const batch = sentenceStrings.slice(i, i + batchSize);
+            console.log(`Processing translation batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(sentenceStrings.length / batchSize)}...`);
+            
+            const numberedInput = batch.map((s, idx) => `[${idx + 1}] ${s}`).join("\n");
+            const prompt = "You are a professional Japanese-Korean translator.\n" +
+              "Translate each of the following Japanese sentences into natural Korean.\n" +
+              "Maintain the exact numbering format in your output.\n" +
+              "Do not include any conversational text. Only output the numbered translations.\n\n" +
+              "Input:\n" + numberedInput + "\n\n" +
+              "Output Format:\n" +
+              "[1] (Korean translation 1)\n" +
+              "[2] (Korean translation 2)\n" +
+              "...";
+
+            let retries = 0;
+            let batchSuccess = false;
+            let parsedTranslations: string[] = [];
+
+            while (retries < 3 && !batchSuccess) {
+              const model = process.env.AI_MODEL || "openai/gpt-oss-120b";
+              const baseUrl = process.env.AI_API_URL || process.env.GROQ_API_BASE || "https://api.groq.com/openai/v1";
+              
+              const response = await fetch(`${baseUrl}/chat/completions`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+                body: JSON.stringify({
+                  model: model,
+                  max_tokens: 3000,
+                  messages: [
+                    { role: "system", content: "You strictly output numbered translations like [1] text. No greetings." },
+                    { role: "user", content: prompt }
+                  ]
+                })
+              });
+
+              if (!response.ok) {
+                const errText = await response.text();
+                if (response.status === 429) {
+                  const match = errText.match(/Please try again in ([0-9.]+)s/);
+                  if (match && retries < 2) {
+                     const waitTime = parseFloat(match[1]) * 1000 + 500;
+                     console.log(`Rate limit hit. Waiting ${waitTime}ms and retrying...`);
+                     await new Promise(r => setTimeout(r, waitTime));
+                     retries++;
+                     continue;
+                  }
+                }
+                throw new Error(`AI API error: ${response.status} - ${errText}`);
+              }
+
+              const data = await response.json();
+              const resultText = data.choices?.[0]?.message?.content || '';
+              
+              // Parse the numbered text
+              parsedTranslations = [];
+              const lines = resultText.split('\n');
+              for (const line of lines) {
+                const match = line.match(/^\[\d+\]\s*(.*)/);
+                if (match && match[1].trim() !== '') {
+                  parsedTranslations.push(match[1].trim());
+                }
+              }
+              
+              if (parsedTranslations.length === batch.length) {
+                batchSuccess = true;
+              } else if (parsedTranslations.length > batch.length) {
+                parsedTranslations = parsedTranslations.slice(0, batch.length);
+                batchSuccess = true;
+              } else {
+                console.warn(`Translation array length mismatch: expected ${batch.length}, got ${parsedTranslations.length}`);
+                retries++;
+              }
+            }
+
+            if (batchSuccess) {
+              translatedStrings.push(...parsedTranslations);
+            } else {
+              console.warn(`Batch failed entirely after 3 retries. Filling with fallback text.`);
+              translatedStrings.push(...Array(batch.length).fill("번역 실패 (AI 응답 오류)"));
+            }
+            
+            if (i + batchSize < sentenceStrings.length) {
+              await new Promise(resolve => setTimeout(resolve, 2000));
+            }
+          }
+          
+          // Map translations back
+          let tIdx = 0;
+          for (let i = 0; i < sentences.length; i++) {
+            if (sentences[i].original.trim().length > 0) {
+              sentences[i].translation = translatedStrings[tIdx++];
+            } else {
+              sentences[i].translation = sentences[i].original;
+            }
+          }
+        } catch (err: any) {
+          console.error("Batch translation failed:", err);
+          errorCode = "번역 오류";
+          errorDetail = err.message || err.toString();
+          for (let i = 0; i < sentences.length; i++) {
+            if (sentences[i].original.trim().length > 0) {
+              sentences[i].translation = `번역을 가져올 수 없습니다 (오류 코드: ${errorCode} | 상세: ${errorDetail.substring(0, 100)}).`;
+            }
+          }
+        }
+      }
+    }
+
+    return { sentences, gemini_analyzed: useAI };
   }
 
   app.get('/api/health', (req, res) => {
@@ -940,6 +937,7 @@ async function startServer() {
     `).all();
     res.json(posts);
   });
+  const processingPosts = new Set<number>();
 
   app.get('/api/posts/:id', authenticate, async (req: any, res) => {
     try {
@@ -957,22 +955,35 @@ async function startServer() {
 
       // If processed_json is missing or a fallback, analyze it on the fly and save to DB
       let needsAnalysis = !post.processed_json;
+      let needsBackgroundAnalysis = false;
+      let currentRetryCount = 0;
+
       if (post.processed_json) {
         try {
           const parsed = JSON.parse(post.processed_json);
-          const sentences = parsed.sentences || [];
-          const hasSentenceFallback = sentences.length === 0 || sentences.some((s: any) => s.tokens && s.tokens.some((t: any) => t.pos === '문장'));
-          const hasWordFallback = sentences.some((s: any) => s.tokens && s.tokens.some((t: any) => t.pos === '단어' && !t.reading));
-          const hasFailedTranslation = sentences.some((s: any) => s.translation === '번역을 가져올 수 없습니다.');
+          currentRetryCount = parsed.retry_count || 0;
           
-          if (hasSentenceFallback || hasFailedTranslation) {
-            needsAnalysis = true;
-          } else if (hasWordFallback) {
-            // Re-analyze if we now have either a Gemini key or the Kuromoji tokenizer is ready
-            const key = process.env.GEMINI_API_KEY;
-            const hasGemini = key && key !== "YOUR_GEMINI_API_KEY";
-            if (hasGemini || tokenizer !== null) {
-              needsAnalysis = true;
+          if (parsed.manually_edited || currentRetryCount >= 3) {
+            needsAnalysis = false;
+          } else {
+            const key = process.env.AI_API_KEY || process.env.OPENAI_API_KEY;
+            const hasAIKey = key && key !== "YOUR_OPENAI_API_KEY" && key !== "YOUR_AI_API_KEY";
+            if (hasAIKey && !parsed.gemini_analyzed) {
+              needsBackgroundAnalysis = true;
+            } else {
+              const sentences = parsed.sentences || [];
+              const hasSentenceFallback = sentences.length === 0 || sentences.some((s: any) => s.tokens && s.tokens.some((t: any) => t.pos === '문장'));
+              const hasWordFallback = sentences.some((s: any) => s.tokens && s.tokens.some((t: any) => t.pos === '단어' && /[\u4e00-\u9faf\u3400-\u4dbf\uf900-\ufaff々]/.test(t.surface) && !t.reading));
+              const hasFailedTranslation = sentences.some((s: any) => s.translation && s.translation.includes('가져올 수 없습니다'));
+              
+              if (hasSentenceFallback || hasFailedTranslation) {
+                needsAnalysis = true;
+              } else if (hasWordFallback) {
+                // Re-analyze if we now have either an AI key or the Kuromoji tokenizer is ready
+                if (hasAIKey || tokenizer !== null) {
+                  needsBackgroundAnalysis = true;
+                }
+              }
             }
           }
         } catch (e) {
@@ -980,15 +991,61 @@ async function startServer() {
         }
       }
 
+      if (processingPosts.has(post.id)) {
+        needsAnalysis = false;
+        needsBackgroundAnalysis = false;
+      }
+
       if (needsAnalysis) {
+        processingPosts.add(post.id);
         try {
           const analysis = await analyzeTextLocally(post.body);
+          
+          const hasSentenceFallback = !analysis.sentences || analysis.sentences.length === 0 || analysis.sentences.some((s: any) => s.tokens && s.tokens.some((t: any) => t.pos === '문장'));
+          const hasFailedTranslation = analysis.sentences && analysis.sentences.some((s: any) => s.translation && s.translation.includes('가져올 수 없습니다'));
+          
+          if (hasSentenceFallback || hasFailedTranslation) {
+            analysis.retry_count = currentRetryCount + 1;
+          } else {
+            analysis.retry_count = 0;
+          }
+
           const analysisStr = JSON.stringify(analysis);
           db.prepare('UPDATE posts SET processed_json = ? WHERE id = ?').run(analysisStr, post.id);
           post.processed_json = analysisStr;
         } catch (err) {
           console.error("Failed to analyze post on GET:", err);
+          const existing = post.processed_json ? JSON.parse(post.processed_json) : {};
+          existing.retry_count = currentRetryCount + 1;
+          const updatedJson = JSON.stringify(existing);
+          db.prepare('UPDATE posts SET processed_json = ? WHERE id = ?').run(updatedJson, post.id);
+          post.processed_json = updatedJson;
+        } finally {
+          processingPosts.delete(post.id);
         }
+      } else if (needsBackgroundAnalysis) {
+        processingPosts.add(post.id);
+        // Run in background to avoid blocking the HTTP response
+        analyzeTextLocally(post.body).then(analysis => {
+          const hasSentenceFallback = !analysis.sentences || analysis.sentences.length === 0 || analysis.sentences.some((s: any) => s.tokens && s.tokens.some((t: any) => t.pos === '문장'));
+          const hasFailedTranslation = analysis.sentences && analysis.sentences.some((s: any) => s.translation && s.translation.includes('가져올 수 없습니다'));
+          
+          if (hasSentenceFallback || hasFailedTranslation) {
+            analysis.retry_count = currentRetryCount + 1;
+          } else {
+            analysis.retry_count = 0;
+          }
+
+          const analysisStr = JSON.stringify(analysis);
+          db.prepare('UPDATE posts SET processed_json = ? WHERE id = ?').run(analysisStr, post.id);
+        }).catch(err => {
+          console.error("Failed to analyze post in background:", err);
+          const existing = post.processed_json ? JSON.parse(post.processed_json) : {};
+          existing.retry_count = currentRetryCount + 1;
+          db.prepare('UPDATE posts SET processed_json = ? WHERE id = ?').run(JSON.stringify(existing), post.id);
+        }).finally(() => {
+          processingPosts.delete(post.id);
+        });
       }
 
       res.json(post);
@@ -1079,12 +1136,6 @@ async function startServer() {
       const post = db.prepare('SELECT * FROM posts WHERE id = ?').get(id) as any;
       if (!post) {
         return res.status(404).json({ error: 'Post not found' });
-      }
-
-      const isAuthor = req.user.id === post.author_id;
-      const isAdminOrAbove = ['admin', 'host', 'master'].includes(req.user.role);
-      if (!isAdminOrAbove && !isAuthor) {
-        return res.status(403).json({ error: '권한이 없습니다.' });
       }
 
       const { processed_json } = req.body;
@@ -1499,52 +1550,52 @@ async function startServer() {
       const cleanUser = (user_translation || '').trim();
       const cleanAI = (ai_translation || '').trim();
 
-      // 1. Try Gemini AI if API Key is available
-      const key = process.env.GEMINI_API_KEY;
-      if (key && key !== "YOUR_GEMINI_API_KEY") {
+      const key = process.env.AI_API_KEY || process.env.OPENAI_API_KEY;
+      if (key && key !== "YOUR_OPENAI_API_KEY" && key !== "YOUR_AI_API_KEY") {
         try {
-          const ai = new GoogleGenAI({ apiKey: key });
-          const prompt = `You are a professional Japanese-Korean language teacher. Evaluate the user's Korean translation of a Japanese sentence.
+          const baseUrl = (process.env.AI_API_URL || "https://api.openai.com/v1").replace(/\/$/, "");
+          const model = process.env.AI_MODEL || "gpt-4o-mini";
+          
+          const prompt = `You are a Japanese-Korean translator grading a user's translation.
 Original Japanese: "${original_sentence}"
-Reference AI Translation: "${cleanAI}"
-User's Translation: "${cleanUser}"
-Grading Standard (Difficulty Level): "${difficulty || 'medium'}"
+User Translation: "${cleanUser}"
+Model Translation: "${cleanAI}"
 
-Grading Criteria for Difficulty Levels:
-- "high" (상): The translation must be highly accurate, with precise vocabulary and correct grammar/particles. Even small errors in particles or nuance should make it incorrect.
-- "medium" (중): The core meaning and main sentence structure must be correct. Minor details or natural phrasing variations are accepted as correct.
-- "low" (하): The general context and approximate meaning just need to be aligned. As long as the basic message is understood, it is accepted as correct.
+Evaluate if the user's translation preserves the meaning of the original Japanese sentence correctly.
+Strictness level: ${difficulty} ('low' means allow liberal translation, 'high' means strict literal translation).
+Return a JSON object:
+{
+  "is_correct": boolean,
+  "feedback": "A short, helpful Korean explanation (max 2 sentences) of what was good or what went wrong compared to the model translation."
+}`;
 
-Based on the criteria, determine if the user's translation is correct.
-Provide 'is_correct' (boolean) and 'feedback' (Korean string).
-The feedback must explain why it is correct or what was wrong/missing compared to the AI translation and the original sentence.
-Keep the feedback extremely concise, direct, and constructive (no more than 2 sentences).`;
-
-          const response = await ai.models.generateContent({
-            model: 'gemini-3.5-flash',
-            contents: prompt,
-            config: {
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  is_correct: { type: Type.BOOLEAN },
-                  feedback: { type: Type.STRING }
-                },
-                required: ["is_correct", "feedback"]
-              }
-            }
+          const response = await fetch(`${baseUrl}/chat/completions`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${key}`
+            },
+            body: JSON.stringify({
+              model: model,
+              messages: [{ role: "user", content: prompt }],
+              response_format: { type: "json_object" }
+            })
           });
 
-          const resultObj = JSON.parse(response.text || '{}');
-          res.json(resultObj);
-          return;
-        } catch (geminiErr) {
-          console.warn("Gemini grading failed, falling back to local rule-based grading:", geminiErr);
+          if (!response.ok) throw new Error("AI API failed");
+          const data = await response.json();
+          const parsed = JSON.parse(data.choices[0].message.content);
+          
+          return res.json({
+            is_correct: !!parsed.is_correct,
+            feedback: `[AI 채점] ${parsed.feedback || "채점이 완료되었습니다."}`
+          });
+        } catch (aiErr) {
+          console.warn("AI grading failed, falling back to local Levenshtein:", aiErr);
         }
       }
 
-      // 2. Local Rule-Based Levenshtein Grading (Fallback)
+      // Fallback: Local Rule-Based Levenshtein Grading
       const similarity = getSimilarity(cleanUser, cleanAI);
       const simPercent = Math.round(similarity * 100);
       
@@ -1658,7 +1709,7 @@ Keep the feedback extremely concise, direct, and constructive (no more than 2 se
     }
   });
 
-  // Extract difficult words using Hybrid mode (Gemini fallback to Local morph filters + Naver Dict Lookup)
+  // Extract difficult words using local morphological filter + Naver Dict Lookup (Gemini removed)
   app.post('/api/extract-difficult-words', authenticate, async (req: any, res) => {
     try {
       const { post_id, level } = req.body; // level: 'N1' | 'N2' | 'N3' | 'N4'
@@ -1669,59 +1720,9 @@ Keep the feedback extremely concise, direct, and constructive (no more than 2 se
 
       let extracted: { word: string; reading_accent: string; meaning: string; level?: string }[] = [];
 
-      // 1. Try Gemini AI if API Key is available
-      const key = process.env.GEMINI_API_KEY;
-      if (key && key !== "YOUR_GEMINI_API_KEY") {
-        try {
-          console.log("Extracting words using Gemini hybrid...");
-          const ai = new GoogleGenAI({ apiKey: key });
-          const prompt = `You are a Japanese vocabulary extractor. Analyze the following Japanese text and extract difficult words that are of JLPT level ${level} or higher (e.g. if level is N3, extract N3, N2, N1 level words).
-Select about 8 to 15 key vocabulary items. For each extracted word, provide:
-1. 'word': the word itself (base/dictionary form).
-2. 'reading_accent': the pronunciation and accent in NHK Accent Dictionary format, like 'たべる[2]' or 'はな[2]'. Make sure it reflects standard accent kernels.
-3. 'meaning': the Korean definition in the context of this text.
-4. 'level': the estimated JLPT level of this word, which must be one of: 'N1', 'N2', 'N3', 'N4', 'N5'.
-
-Text to analyze:
-${post.body}`;
-
-          const response = await ai.models.generateContent({
-            model: 'gemini-3.5-flash',
-            contents: prompt,
-            config: {
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  words: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        word: { type: Type.STRING },
-                        reading_accent: { type: Type.STRING },
-                        meaning: { type: Type.STRING },
-                        level: { type: Type.STRING }
-                      },
-                      required: ["word", "reading_accent", "meaning", "level"]
-                    }
-                  }
-                },
-                required: ["words"]
-              }
-            }
-          });
-
-          const resultObj = JSON.parse(response.text || '{}');
-          extracted = resultObj.words || [];
-        } catch (geminiErr) {
-          console.warn("Gemini word extraction failed, falling back to local rule-based extraction:", geminiErr);
-        }
-      }
-
-      // 2. Local fallback using Morphological filter + Live Naver Dictionary lookups
-      if (extracted.length === 0 && post.processed_json) {
-        console.log("Extracting words using local fallback...");
+      // Local morphological extraction + Live Naver Dictionary lookups
+      if (post.processed_json) {
+        console.log("Extracting words using local morphological extraction...");
         try {
           const parsed = JSON.parse(post.processed_json);
           const sentences = parsed.sentences || [];
@@ -1805,26 +1806,29 @@ ${post.body}`;
 
           // Group by level match
           const matchedWords: typeof lookupResults = [];
-          const otherWords: typeof lookupResults = [];
+          const noLevelWords: typeof lookupResults = [];
 
           for (const res of lookupResults) {
             if (res.level) {
               const levelNum = parseInt(res.level.replace('N', ''));
-              if (!isNaN(levelNum) && levelNum <= targetLevelNum) {
-                matchedWords.push(res);
+              if (!isNaN(levelNum)) {
+                if (levelNum <= targetLevelNum) {
+                  matchedWords.push(res);
+                }
+                // If levelNum > targetLevelNum (e.g. levelNum = 4 for target N3), completely discard it
               } else {
-                otherWords.push(res);
+                noLevelWords.push(res);
               }
             } else {
-              otherWords.push(res);
+              noLevelWords.push(res);
             }
           }
 
-          // Build final list of up to 12 words prioritizing matched ones
+          // Build final list of up to 12 words prioritizing matched ones and using no-level words as fallback
           const finalWords = [...matchedWords];
           if (finalWords.length < 12) {
             const needed = 12 - finalWords.length;
-            finalWords.push(...otherWords.slice(0, needed));
+            finalWords.push(...noLevelWords.slice(0, needed));
           }
 
           extracted = finalWords.slice(0, 12);
@@ -1840,7 +1844,7 @@ ${post.body}`;
           .get(req.user.id, post.title, w.word);
         if (!existing) {
           db.prepare('INSERT INTO vocabulary (user_id, post_title, word, reading_accent, meaning, level) VALUES (?, ?, ?, ?, ?, ?)')
-            .run(req.user.id, post.title, w.word, w.reading_accent, w.meaning, w.level || '');
+             .run(req.user.id, post.title, w.word, w.reading_accent, w.meaning, w.level || '');
           addedCount++;
         }
       });
@@ -1852,81 +1856,87 @@ ${post.body}`;
     }
   });
 
-  // Grade word meaning (semantic comparison)
+  // Grade word meaning (semantic comparison - Gemini removed)
   app.post('/api/grade-word-meaning', async (req, res) => {
     try {
       const { word, correct_meaning, user_meaning } = req.body;
-      const key = process.env.GEMINI_API_KEY;
-      if (!key) {
-        return res.status(500).json({ error: 'GEMINI_API_KEY is missing' });
+      
+      const normalizeMeaning = (text: string): string => {
+        return (text || '')
+          .replace(/[^가-힣a-zA-Z0-9\s]/g, '')
+          .replace(/\s+/g, '')
+          .toLowerCase();
+      };
+
+      const cleanUser = normalizeMeaning(user_meaning);
+      const cleanCorrect = normalizeMeaning(correct_meaning);
+
+      // Check for exact substring match first (user wrote one of the meanings)
+      const meaningParts = (correct_meaning || '')
+        .split(/[,、，\s\.\/]+/)
+        .map(p => normalizeMeaning(p))
+        .filter(Boolean);
+
+      const exactMeaningMatch = meaningParts.some(part => 
+        part === cleanUser || cleanUser.includes(part) || part.includes(cleanUser)
+      );
+
+      let isCorrect = false;
+      let feedback = '';
+
+      if (exactMeaningMatch) {
+        isCorrect = true;
+        feedback = '정확한 뜻입니다!';
+      } else {
+        const maxLen = Math.max(cleanUser.length, cleanCorrect.length);
+        const dist = getLevenshteinDistance(cleanUser, cleanCorrect);
+        const sim = maxLen > 0 ? 1 - dist / maxLen : 0;
+        isCorrect = sim >= 0.5;
+        feedback = isCorrect 
+          ? `유사한 뜻으로 인정됩니다. (유사도 ${Math.round(sim * 100)}%)`
+          : `사전 뜻과 차이가 있습니다. (유사도 ${Math.round(sim * 100)}%)`;
       }
 
-      const ai = new GoogleGenAI({ apiKey: key });
-      const prompt = `Evaluate if the user's Korean answer for the meaning of the Japanese word "${word}" is semantically equivalent to the correct dictionary meaning.
-Correct dictionary meaning: "${correct_meaning}"
-User's answer: "${user_meaning}"
-
-Determine if the user's answer means essentially the same thing, even if the wording is slightly different.
-Provide 'is_correct' (boolean) and a very short 'feedback' (Korean string, 1 sentence) explaining the judgment.`;
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.5-flash',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              is_correct: { type: Type.BOOLEAN },
-              feedback: { type: Type.STRING }
-            },
-            required: ["is_correct", "feedback"]
-          }
-        }
-      });
-
-      res.json(JSON.parse(response.text || '{}'));
+      res.json({ is_correct: isCorrect, feedback });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: 'Failed to grade meaning' });
     }
   });
 
-  // Grade word reading (flexible pronunciation matching including Romaji/Hangul)
+  // Grade word reading (flexible pronunciation matching including Romaji/Hangul - Gemini removed)
   app.post('/api/grade-word-reading', async (req, res) => {
     try {
       const { word, correct_reading_accent, user_reading } = req.body;
-      const key = process.env.GEMINI_API_KEY;
-      if (!key) {
-        return res.status(500).json({ error: 'GEMINI_API_KEY is missing' });
+
+      const normalizeReading = (text: string): string => {
+        return (text || '')
+          .replace(/<\/?strong>/g, '')
+          .replace(/\[[\d]+\]/g, '')
+          .replace(/[￣＼\s\[\]]/g, '')
+          .toLowerCase();
+      };
+
+      const correctReadingClean = katakanaToHiragana(normalizeReading(correct_reading_accent));
+      const userReadingClean = katakanaToHiragana(normalizeReading(user_reading));
+      
+      let isCorrect = false;
+      let feedback = '';
+
+      if (correctReadingClean === userReadingClean) {
+        isCorrect = true;
+        feedback = '정확한 발음입니다!';
+      } else {
+        const maxLen = Math.max(correctReadingClean.length, userReadingClean.length);
+        const dist = getLevenshteinDistance(correctReadingClean, userReadingClean);
+        const sim = maxLen > 0 ? 1 - dist / maxLen : 0;
+        isCorrect = sim >= 0.75;
+        feedback = isCorrect 
+          ? `유사한 발음으로 인정됩니다. (유사도 ${Math.round(sim * 100)}%)`
+          : `발음이 다릅니다. (유사도 ${Math.round(sim * 100)}%)`;
       }
 
-      const ai = new GoogleGenAI({ apiKey: key });
-      const prompt = `Evaluate if the user's input pronunciation for the Japanese word "${word}" is correct.
-The correct pronunciation (hiragana/accent): "${correct_reading_accent}" (e.g. "たべる[2]" means target hiragana is "たべる").
-User's input: "${user_reading}"
-
-The user is allowed to write the pronunciation in Korean transliteration (e.g., "타베루"), Romaji (e.g., "taberu"), Katakana (e.g., "タベル"), or Hiragana (e.g., "たべる").
-Determine if the user's input represents the correct pronunciation of the target word.
-Provide 'is_correct' (boolean) and a short 'feedback' (Korean string, 1 sentence).`;
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.5-flash',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              is_correct: { type: Type.BOOLEAN },
-              feedback: { type: Type.STRING }
-            },
-            required: ["is_correct", "feedback"]
-          }
-        }
-      });
-
-      res.json(JSON.parse(response.text || '{}'));
+      res.json({ is_correct: isCorrect, feedback });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: 'Failed to grade reading' });
